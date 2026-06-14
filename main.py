@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+from datetime import datetime, timezone
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -15,6 +16,7 @@ from telethon.errors import (
     InviteHashInvalidError,
     InviteHashExpiredError,
     UserAlreadyParticipantError,
+    FloodWaitError,
 )
 from dotenv import load_dotenv
 
@@ -39,6 +41,12 @@ DESTINATION_ID = int(os.environ["DESTINATION_CHAT_ID"])
 #   - Public handles:       @mychannel  or  t.me/mychannel
 #   - Private invite links: t.me/+AbCdEfGhIjKl
 RAW_SOURCES = [s.strip() for s in os.environ["SOURCE_CHATS"].split(",") if s.strip()]
+
+# How many recent messages to catch up on per source at startup (default: 50)
+CATCHUP_LIMIT = int(os.environ.get("CATCHUP_LIMIT", "50"))
+
+# Delay between catch-up messages to avoid Telegram flood limits (seconds)
+CATCHUP_DELAY = float(os.environ.get("CATCHUP_DELAY", "0.5"))
 
 # ── Regexes ────────────────────────────────────────────────────────────────────
 _PRIVATE_INVITE_RE = re.compile(r"(?:https?://)?t\.me/\+([A-Za-z0-9_-]+)", re.IGNORECASE)
@@ -89,7 +97,6 @@ async def resolve_source(client: TelegramClient, raw: str):
                 )
                 return chat
             except UserAlreadyParticipantError:
-                # Race condition: joined between check and import; search dialogs
                 pass
 
         except (InviteHashInvalidError, InviteHashExpiredError) as exc:
@@ -99,11 +106,6 @@ async def resolve_source(client: TelegramClient, raw: str):
             log.error("Could not resolve private invite '%s': %s", raw, exc)
             return None
 
-        # Fallback: scan open dialogs for a match (handles race condition above)
-        async for dialog in client.iter_dialogs():
-            # Invite hashes don't map to usernames, so we can't match by name;
-            # just return None and let the user provide a numeric ID instead.
-            pass
         log.warning("Could not resolve '%s' after join attempt; skip.", raw)
         return None
 
@@ -143,23 +145,20 @@ def has_link(message) -> bool:
     return False
 
 
-# ── Core message handler ───────────────────────────────────────────────────────
-async def handle_message(client: TelegramClient, event) -> None:
-    msg = event.message
-
+# ── Single message processor (shared by catch-up and live handler) ─────────────
+async def process_message(client: TelegramClient, msg, chat_id=None) -> None:
+    """
+    Applies Rule 1 (forward if link) or Rule 2 (copy if no link).
+    Works for both catch-up messages and live incoming events.
+    """
+    source_label = chat_id or "?"
     try:
         if has_link(msg):
-            # Rule 1 — FORWARD
-            # Keeps the "Forwarded from [Source]" header and all links intact.
-            log.info("FORWARD  | chat=%-20s  msg_id=%s  (link detected)", event.chat_id, msg.id)
+            log.info("FORWARD  | chat=%-20s  msg_id=%s  (link detected)", source_label, msg.id)
             await client.forward_messages(DESTINATION_ID, msg)
-
         else:
-            # Rule 2 — COPY
-            # Sends content cleanly with no forwarding attribution.
-            log.info("COPY     | chat=%-20s  msg_id=%s", event.chat_id, msg.id)
+            log.info("COPY     | chat=%-20s  msg_id=%s", source_label, msg.id)
             text = msg.text or msg.message or ""
-
             if msg.media:
                 await client.send_message(
                     DESTINATION_ID,
@@ -174,8 +173,45 @@ async def handle_message(client: TelegramClient, event) -> None:
                     parse_mode="html",
                 )
 
+    except FloodWaitError as e:
+        log.warning("FloodWait: sleeping %ds as requested by Telegram…", e.seconds)
+        await asyncio.sleep(e.seconds)
     except Exception as exc:
-        log.error("Failed to process msg_id=%s from chat=%s: %s", msg.id, event.chat_id, exc)
+        log.error("Failed to process msg_id=%s from chat=%s: %s", msg.id, source_label, exc)
+
+
+# ── Catch-up: replay missed messages on startup ────────────────────────────────
+async def catchup(client: TelegramClient, source) -> None:
+    """
+    Fetches the last CATCHUP_LIMIT messages from `source` (oldest first)
+    and processes each one through the forward/copy logic.
+    """
+    try:
+        entity = await client.get_entity(source)
+        title  = getattr(entity, "title", getattr(entity, "username", str(source)))
+    except Exception:
+        entity = source
+        title  = str(source)
+
+    log.info("Catch-up | starting for: %s (limit=%d)", title, CATCHUP_LIMIT)
+
+    # iter_messages returns newest-first; reverse so we send oldest first
+    messages = []
+    async for msg in client.iter_messages(entity, limit=CATCHUP_LIMIT):
+        messages.append(msg)
+
+    messages.reverse()  # oldest → newest order
+
+    sent = 0
+    for msg in messages:
+        # Skip empty service messages (joins, pins, etc.)
+        if not msg.text and not msg.media:
+            continue
+        await process_message(client, msg, chat_id=getattr(entity, "id", source))
+        sent += 1
+        await asyncio.sleep(CATCHUP_DELAY)  # be gentle on flood limits
+
+    log.info("Catch-up | done for %s — %d message(s) processed", title, sent)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -200,10 +236,17 @@ async def main() -> None:
 
     log.info("Monitoring %d source(s) → destination %s", len(resolved), DESTINATION_ID)
 
-    # Register handler against resolved entities
+    # ── Catch-up: replay missed messages from each source ────────────────────
+    if CATCHUP_LIMIT > 0:
+        log.info("Starting catch-up for all sources (CATCHUP_LIMIT=%d)…", CATCHUP_LIMIT)
+        for source in resolved:
+            await catchup(client, source)
+        log.info("Catch-up complete. Switching to live mode…")
+
+    # ── Live listener ────────────────────────────────────────────────────────
     @client.on(events.NewMessage(chats=resolved))
     async def _handler(event):
-        await handle_message(client, event)
+        await process_message(client, event.message, chat_id=event.chat_id)
 
     log.info("Bot is running. Press Ctrl+C to stop.")
     await client.run_until_disconnected()
