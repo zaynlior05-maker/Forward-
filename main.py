@@ -112,20 +112,25 @@ async def send_as_copy(client: TelegramClient, msg, text: str) -> None:
 
         if buf:
             media_buf = BytesIO(buf)
-            # Preserve original filename for documents/videos
-            filename = None
-            if hasattr(msg, "document") and msg.document:
+
+            if msg.photo:
+                # Photos must be named with an image extension so Telegram
+                # renders them inline instead of as a file attachment
+                media_buf.name = "photo.jpg"
+            elif hasattr(msg, "document") and msg.document:
+                # Documents/videos: preserve original filename
+                filename = None
                 for attr in msg.document.attributes:
                     if hasattr(attr, "file_name"):
                         filename = attr.file_name
                         break
-            if filename:
-                media_buf.name = filename
+                media_buf.name = filename or "file"
 
             await client.send_message(
                 DESTINATION_ID,
                 message=text,
                 file=media_buf,
+                force_document=False,  # always render as photo/video, not attachment
                 parse_mode="html",
             )
             log.info("Media re-uploaded successfully (msg_id=%s)", msg.id)
