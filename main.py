@@ -100,47 +100,70 @@ def has_link(message) -> bool:
     return False
 
 
+# mime type -> filename so Telegram renders correctly
+_MIME_TO_NAME = {
+    "image/jpeg":      "photo.jpg",
+    "image/png":       "photo.png",
+    "image/webp":      "photo.webp",
+    "image/gif":       "animation.gif",
+    "video/mp4":       "video.mp4",
+    "video/mpeg":      "video.mpeg",
+    "video/webm":      "video.webm",
+    "video/quicktime": "video.mov",
+}
+
 # ── Media sender (download → re-upload, bypasses all channel restrictions) ─────
 async def send_as_copy(client: TelegramClient, msg, text: str) -> None:
     """
-    Downloads media into memory and re-uploads it to the destination.
-    This works even for channels with 'Restrict saving content' enabled.
+    Downloads media into memory and re-uploads to the destination.
+    Photos sent as photos, videos as videos, documents as documents.
+    Works even on channels with Restrict saving content enabled.
     """
     if msg.media:
-        log.info("Downloading media for msg_id=%s…", msg.id)
+        log.info("Downloading media for msg_id=%s...", msg.id)
         buf = await client.download_media(msg, file=bytes)
 
         if buf:
             media_buf = BytesIO(buf)
 
             if msg.photo:
-                # Photos must be named with an image extension so Telegram
-                # renders them inline instead of as a file attachment
+                # Native Telegram photo -- render inline as image
                 media_buf.name = "photo.jpg"
-            elif hasattr(msg, "document") and msg.document:
-                # Documents/videos: preserve original filename
+
+            elif msg.document:
+                doc  = msg.document
+                mime = getattr(doc, "mime_type", "") or ""
+
+                # 1) Use original filename if available (e.g. clip.mp4)
                 filename = None
-                for attr in msg.document.attributes:
-                    if hasattr(attr, "file_name"):
+                for attr in doc.attributes:
+                    if hasattr(attr, "file_name") and attr.file_name:
                         filename = attr.file_name
                         break
-                media_buf.name = filename or "file"
 
-            await client.send_message(
+                # 2) Fall back to mime-type map so videos stay videos not files
+                if not filename:
+                    filename = _MIME_TO_NAME.get(mime, "file")
+
+                media_buf.name = filename
+
+            # force_document=False lets Telegram decide rendering from extension
+            await client.send_file(
                 DESTINATION_ID,
-                message=text,
                 file=media_buf,
-                force_document=False,  # always render as photo/video, not attachment
+                caption=text,
+                force_document=False,
                 parse_mode="html",
             )
             log.info("Media re-uploaded successfully (msg_id=%s)", msg.id)
+
         else:
-            # Media unavailable — send text only
-            log.warning("Media download returned empty for msg_id=%s — sending text only", msg.id)
+            log.warning("Media download empty for msg_id=%s -- text only", msg.id)
             if text:
                 await client.send_message(DESTINATION_ID, message=text, parse_mode="html")
     elif text:
         await client.send_message(DESTINATION_ID, message=text, parse_mode="html")
+
 
 
 # ── Core message processor ─────────────────────────────────────────────────────
